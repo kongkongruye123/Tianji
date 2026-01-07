@@ -88,7 +88,13 @@ def create_vectordb(
             shutil.rmtree(persist_directory)
         else:
             os.remove(persist_directory)
-    loader = DirectoryLoader(data_path, glob="*.txt", loader_cls=TextLoader)
+    # 使用 UTF-8 编码加载文件，避免 Windows 系统上的编码问题
+    loader = DirectoryLoader(
+        data_path, 
+        glob="*.txt", 
+        loader_cls=TextLoader,
+        loader_kwargs={"encoding": "utf-8"}
+    )
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size, chunk_overlap=200
     )
@@ -96,14 +102,66 @@ def create_vectordb(
     if len(split_docs) == 0:
         loguru.logger.error("Invalid knowledge data, processing data results in empty, check if data download failed, can be downloaded manually")
         raise gr.Error("Invalid knowledge data, processing data results in empty, check if data download failed, can be downloaded manually")
+    
+    # 处理 API 速率限制：分批处理文档并添加延迟
+    loguru.logger.info("开始创建向量数据库，文档数量: {}", len(split_docs))
     try:
-        vector_db = Chroma.from_documents(
-            documents=split_docs,
-            embedding=embedding_func,
-            persist_directory=persist_directory,
-        )
+        # 分批处理文档以避免速率限制
+        batch_size = 10  # 每批处理10个文档
+        import time
+        
+        # 如果文档数量较多，分批添加
+        if len(split_docs) > batch_size:
+            loguru.logger.info("文档数量较多，将分批处理以避免速率限制...")
+            # 先创建空的向量数据库
+            vector_db = Chroma(
+                embedding_function=embedding_func,
+                persist_directory=persist_directory,
+            )
+            
+            # 分批添加文档
+            for i in range(0, len(split_docs), batch_size):
+                batch = split_docs[i:i + batch_size]
+                loguru.logger.info("处理批次 {}/{} (共 {} 个文档)", 
+                                  i // batch_size + 1, 
+                                  (len(split_docs) + batch_size - 1) // batch_size,
+                                  len(batch))
+                try:
+                    vector_db.add_documents(batch)
+                    # 添加延迟以避免速率限制（每分钟请求数限制）
+                    if i + batch_size < len(split_docs):
+                        time.sleep(1)  # 每批之间延迟1秒
+                except Exception as batch_error:
+                    error_msg = str(batch_error)
+                    if "RPM limit exceeded" in error_msg or "403" in error_msg:
+                        loguru.logger.warning("遇到速率限制，等待60秒后重试...")
+                        time.sleep(60)  # 等待60秒
+                        vector_db.add_documents(batch)  # 重试
+                    else:
+                        raise batch_error
+        else:
+            # 文档数量少，直接创建
+            vector_db = Chroma.from_documents(
+                documents=split_docs,
+                embedding=embedding_func,
+                persist_directory=persist_directory,
+            )
+        loguru.logger.info("向量数据库创建成功")
     except Exception as e:
-        loguru.logger.error("创建数据库失败: {}", str(e))
+        error_msg = str(e)
+        loguru.logger.error("创建数据库失败: {}", error_msg)
+        if "RPM limit exceeded" in error_msg or "403" in error_msg:
+            loguru.logger.error("API 速率限制已超出。请:")
+            loguru.logger.error("1. 等待一段时间后重试")
+            loguru.logger.error("2. 完成 SiliconFlow 身份验证以解除限制")
+            loguru.logger.error("3. 使用 --force 参数时，可以分批运行或使用本地嵌入模型")
+            raise gr.Error(
+                "API 速率限制已超出。\n"
+                "解决方案：\n"
+                "1. 等待1-2分钟后重试\n"
+                "2. 完成 SiliconFlow 身份验证以解除限制\n"
+                "3. 如果已有数据库，不使用 --force 参数直接运行"
+            )
         raise e
     return vector_db
 
@@ -136,13 +194,20 @@ def format_docs(docs):
 def handle_question(chain, question: str, chat_history):
     if not question:
         return "", chat_history
+    if chat_history is None:
+        chat_history = []
     try:
         result = chain.invoke(question)
-        chat_history.append((question, result))
+        # 使用字典格式兼容新版本 Gradio
+        chat_history.append({"role": "user", "content": question})
+        chat_history.append({"role": "assistant", "content": result})
         return "", chat_history
     except Exception as e:
         loguru.logger.error("处理问题时发生错误: {}", str(e))
-        return str(e), chat_history
+        error_msg = str(e)
+        chat_history.append({"role": "user", "content": question})
+        chat_history.append({"role": "assistant", "content": f"错误: {error_msg}"})
+        return "", chat_history
 
 
 # Define scenarios
@@ -157,6 +222,14 @@ scenarios = {
 
 # Initialize chains for all scenarios
 chains = {}
+loguru.logger.info("=" * 60)
+loguru.logger.info("开始初始化所有场景的知识库...")
+loguru.logger.info("提示：如果遇到速率限制错误，可以：")
+loguru.logger.info("1. 等待1-2分钟后重试（不使用 --force）")
+loguru.logger.info("2. 完成 SiliconFlow 身份验证以解除限制")
+loguru.logger.info("3. 如果数据库已存在，直接运行（不使用 --force）")
+loguru.logger.info("=" * 60)
+
 for scenario_name, scenario_folder in scenarios.items():
     data_path = os.path.join(
         TIANJI_PATH, "temp", "tianji-chinese", "RAG", scenario_folder
@@ -165,7 +238,22 @@ for scenario_name, scenario_folder in scenarios.items():
         raise FileNotFoundError(f"Data path does not exist: {data_path}")
 
     persist_directory = os.path.join(TIANJI_PATH, "temp", f"chromadb_{scenario_folder}")
-    chains[scenario_name] = initialize_chain(args.chunk_size, persist_directory, data_path, args.force)
+    loguru.logger.info("正在初始化场景: {} ({})", scenario_name, scenario_folder)
+    try:
+        chains[scenario_name] = initialize_chain(args.chunk_size, persist_directory, data_path, args.force)
+        loguru.logger.info("场景 {} 初始化成功", scenario_name)
+    except Exception as e:
+        error_msg = str(e)
+        if "RPM limit exceeded" in error_msg or "403" in error_msg:
+            loguru.logger.error("场景 {} 初始化失败：API 速率限制", scenario_name)
+            loguru.logger.error("请等待后重试，或完成身份验证")
+            # 如果其他场景已初始化，继续运行；否则退出
+            if len(chains) == 0:
+                raise e
+        else:
+            raise e
+
+loguru.logger.info("所有场景初始化完成，共 {} 个场景", len(chains))
 
 # Create Gradio interface
 TITLE = """
@@ -223,7 +311,7 @@ with gr.Blocks() as demo:
     with gr.Tabs() as tabs:
         for scenario_name in scenarios.keys():
             with gr.Tab(scenario_name):
-                chatbot = gr.Chatbot(height=450, show_copy_button=True)
+                chatbot = gr.Chatbot(height=450)
                 msg = gr.Textbox(label="输入你的疑问")
 
                 examples = gr.Examples(

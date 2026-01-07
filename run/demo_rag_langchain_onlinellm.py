@@ -70,7 +70,13 @@ def create_vectordb(
             os.remove(persist_directory)
 
     if data_type == "folder":
-        loader = DirectoryLoader(data_path, glob="*.txt", loader_cls=TextLoader)
+        # 使用 UTF-8 编码加载文件，避免 Windows 系统上的编码问题
+        loader = DirectoryLoader(
+            data_path, 
+            glob="*.txt", 
+            loader_cls=TextLoader,
+            loader_kwargs={"encoding": "utf-8"}
+        )
     elif data_type == "web":
         loader = WebBaseLoader(
             web_paths=(data_path,),
@@ -149,12 +155,19 @@ def handle_question(chain, question: str, chat_history):
     """
     if not question:
         return "", chat_history
+    if chat_history is None:
+        chat_history = []
     try:
         result = chain.invoke(question)
-        chat_history.append((question, result))
+        # 使用字典格式兼容新版本 Gradio
+        chat_history.append({"role": "user", "content": question})
+        chat_history.append({"role": "assistant", "content": result})
         return "", chat_history
     except Exception as e:
-        return str(e), chat_history
+        error_msg = str(e)
+        chat_history.append({"role": "user", "content": question})
+        chat_history.append({"role": "assistant", "content": f"错误: {error_msg}"})
+        return "", chat_history
 
 
 def update_settings(
@@ -226,7 +239,7 @@ with gr.Blocks() as demo:
         )
         update_button = gr.Button("初始化数据库")
 
-    chatbot = gr.Chatbot(height=450, show_copy_button=True)
+    chatbot = gr.Chatbot(height=450)
     msg = gr.Textbox(label="问题/提示")
 
     with gr.Row():

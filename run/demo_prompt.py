@@ -11,8 +11,9 @@ from tianji import TIANJI_PATH
 
 # 添加命令行参数解析
 parser = argparse.ArgumentParser(description='Launch Gradio application')
-parser.add_argument('--listen', action='store_true', help='Specify to listen on 0.0.0.0')
-parser.add_argument('--port', type=int, default=None, help='The port the server should listen on')
+parser.add_argument('--listen', action='store_true', help='Listen on 0.0.0.0 (allow external access). Default: True')
+parser.add_argument('--local-only', action='store_true', help='Only allow localhost access (127.0.0.1)')
+parser.add_argument('--port', type=int, default=7860, help='The port the server should listen on (default: 7860)')
 parser.add_argument('--root_path', type=str, default=None, help='The root path of the server')
 args = parser.parse_args()
 
@@ -43,28 +44,24 @@ def get_system_prompt_by_name(name):
     return None  # If the name is not found
 
 
-def change_example(name, cls_choose_value, chatbot):
+def change_example(name, cls_choose_value):
     now_example = []
-    if chatbot is not None:
-        print("切换场景清理bot历史")
-        chatbot.clear()
     for i in cls_choose_value:
         if i["name"] == name:
             now_example = [[j["input"], j["output"]] for j in i["example"]]
-    if now_example is []:
+    if now_example == []:
         raise gr.Error("获取example出错！")
-    return gr.update(samples=now_example), chat_history
+    # 返回清空的聊天历史（空列表）
+    return gr.update(samples=now_example), []
 
 
-def random_button_click(chatbot):
+def random_button_click():
     choice_number = random.randint(0, 6)
     now_id = choice_number + 1
     cls_choose = CHOICES[choice_number]
     now_json_data = _get_id_json_id(choice_number)
     random_name = [i["name"] for i in now_json_data]
-    if chatbot is not None:
-        print("切换场景清理bot历史")
-        chatbot.clear()
+    print("切换场景，将清空bot历史")
     return (
         cls_choose,
         now_json_data,
@@ -78,7 +75,7 @@ def example_click(dataset, name, now_json):
         if i["name"] == name:
             system = i["system_prompt"]
 
-    if system_prompt == "":
+    if system == "":
         print(name, now_json)
         raise "遇到代码问题，清重新选择场景"
     return dataset[0], system
@@ -106,18 +103,30 @@ def cls_choose_change(idx):
 
 
 def combine_message_and_history(message, chat_history):
-    # 将聊天历史中的每个元素（假设是元组）转换为字符串
-    history_str = "\n".join(f"{sender}: {text}" for sender, text in chat_history)
+    # 将聊天历史中的每个元素转换为字符串
+    # 兼容新旧格式：字典格式 {"role": "user", "content": "..."} 或列表格式 ["user", "..."]
+    history_parts = []
+    for item in chat_history:
+        if isinstance(item, dict):
+            role = item.get("role", "user")
+            content = item.get("content", "")
+            history_parts.append(f"{role.capitalize()}: {content}")
+        elif isinstance(item, list) and len(item) >= 2:
+            history_parts.append(f"{item[0]}: {item[1]}")
+    
+    history_str = "\n".join(history_parts)
 
     # 将新消息和聊天历史结合成一个字符串
-    full_message = f"{history_str}\nUser: {message}"
+    full_message = f"{history_str}\nUser: {message}" if history_str else f"User: {message}"
     return full_message
 
 
 def respond(system_prompt, message, chat_history):
+    if chat_history is None:
+        chat_history = []
     if len(chat_history) > 11:
         chat_history.clear()  # 清空聊天历史
-        chat_history.append(["请注意", "对话超过 已重新开始"])
+        chat_history.append({"role": "assistant", "content": "对话超过限制，已重新开始"})
     # 合并消息和聊天历史
     message1 = combine_message_and_history(message, chat_history)
     print(message1)
@@ -132,8 +141,9 @@ def respond(system_prompt, message, chat_history):
 
     # 提取模型生成的回复内容
     bot_message_text = response.choices[0].message.content
-    # 更新聊天历史
-    chat_history.append([message, bot_message_text])  # 用户的消息
+    # 更新聊天历史 - 使用字典格式
+    chat_history.append({"role": "user", "content": message})
+    chat_history.append({"role": "assistant", "content": bot_message_text})
 
     return "", chat_history
 
@@ -144,11 +154,19 @@ def clear_history(chat_history):
 
 
 def regenerate(chat_history, system_prompt):
-    if chat_history:
-        # 提取上一条输入消息
-        last_message = chat_history[-1][0]
-        # 移除最后一条记录
-        chat_history.pop()
+    if chat_history and len(chat_history) >= 2:
+        # 移除最后两条记录（用户消息和助手回复）
+        chat_history.pop()  # 移除助手回复
+        last_user_msg = chat_history.pop()  # 移除用户消息并保存
+        
+        # 提取用户消息内容
+        if isinstance(last_user_msg, dict):
+            last_message = last_user_msg.get("content", "")
+        elif isinstance(last_user_msg, list) and len(last_user_msg) >= 2:
+            last_message = last_user_msg[0]
+        else:
+            return "", chat_history
+        
         # 使用上一条输入消息调用 respond 函数以生成新的回复
         msg, chat_history = respond(system_prompt, last_message, chat_history)
     # 返回更新后的聊天记录
@@ -164,7 +182,7 @@ TITLE = """
 """
 
 with gr.Blocks() as demo:
-    chat_history = gr.State()
+    chat_history = gr.State(value=[])
     now_json_data = gr.State(value=_get_id_json_id(0))
     now_name = gr.State()
     gr.Markdown(TITLE)
@@ -192,7 +210,8 @@ with gr.Blocks() as demo:
             )
         with gr.Column(scale=4):
             chatbot = gr.Chatbot(
-                label="聊天界面", value=[["如果喜欢，请给我们一个⭐，谢谢", "不知道选哪个？试试点击随机按钮把！"]]
+                label="聊天界面", 
+                value=[{"role": "assistant", "content": "如果喜欢，请给我们一个⭐，谢谢！不知道选哪个？试试点击随机按钮把！"}]
             )
             msg = gr.Textbox(label="输入信息")
             msg.submit(
@@ -214,8 +233,8 @@ with gr.Blocks() as demo:
     )
     dorpdown_name.change(
         fn=change_example,
-        inputs=[dorpdown_name, now_json_data, chatbot],
-        outputs=[input_example, chat_history],
+        inputs=[dorpdown_name, now_json_data],
+        outputs=[input_example, chatbot],
     )
     input_example.click(
         fn=example_click,
@@ -224,11 +243,33 @@ with gr.Blocks() as demo:
     )
     random_button.click(
         fn=random_button_click,
-        inputs=chatbot,
+        inputs=[],
         outputs=[cls_choose, now_json_data, dorpdown_name],
+    ).then(
+        fn=lambda: [],
+        inputs=[],
+        outputs=[chatbot],
     )
 
 if __name__ == "__main__":
-    server_name = '0.0.0.0' if args.listen else None
+    # 默认监听所有网络接口(0.0.0.0)，允许局域网内其他设备访问
+    # 如果只想本地访问，使用 --local-only 参数
+    if args.local_only:
+        server_name = '127.0.0.1'  # 仅本地访问
+    else:
+        server_name = '0.0.0.0'  # 允许外部访问（默认）
+    
     server_port = args.port
-    demo.launch(server_name=server_name, server_port=server_port, root_path=args.root_path)
+    
+    print(f"🚀 启动服务器: http://{server_name}:{server_port}")
+    if server_name == '0.0.0.0':
+        print("📱 局域网内其他设备可通过以下地址访问:")
+        print(f"   http://<你的IP地址>:{server_port}")
+        print("   提示: 在命令行运行 'ipconfig' (Windows) 或 'ifconfig' (Linux/Mac) 查看你的IP地址")
+    
+    demo.launch(
+        server_name=server_name, 
+        server_port=server_port, 
+        root_path=args.root_path,
+        share=False  # 如果需要公网访问，可以设置为 True 生成临时链接
+    )

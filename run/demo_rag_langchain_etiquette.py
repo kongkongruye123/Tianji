@@ -10,18 +10,26 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain import hub
 from tianji import TIANJI_PATH
 from huggingface_hub import snapshot_download
+import argparse
 
 # 加载环境变量
 load_dotenv()
 
+# 添加命令行参数解析
+parser = argparse.ArgumentParser(description='Launch Gradio RAG application')
+parser.add_argument('--local-only', action='store_true', help='Only allow localhost access (127.0.0.1)')
+parser.add_argument('--port', type=int, default=7860, help='The port the server should listen on (default: 7860)')
+parser.add_argument('--root_path', type=str, default=None, help='The root path of the server')
+args = parser.parse_args()
+
 # 使用 Hugging Face 的 huggingface_hub 下载数据集
 destination_folder = os.path.join(TIANJI_PATH, "temp", "tianji-chinese")
-snapshot_download(
-    repo_id="sanbu/tianji-chinese",
-    local_dir=destination_folder,
-    repo_type="dataset",
-    local_dir_use_symlinks=False,
-)
+if not os.path.exists(destination_folder):
+    snapshot_download(
+        repo_id="sanbu/tianji-chinese",
+        local_dir=destination_folder,
+        repo_type="dataset",
+    )
 
 
 def create_vectordb(
@@ -44,7 +52,13 @@ def create_vectordb(
         else:
             os.remove(persist_directory)
 
-    loader = DirectoryLoader(data_path, glob="*.txt", loader_cls=TextLoader)
+    # 使用 UTF-8 编码加载文件，避免 Windows 系统上的编码问题
+    loader = DirectoryLoader(
+        data_path, 
+        glob="*.txt", 
+        loader_cls=TextLoader,
+        loader_kwargs={"encoding": "utf-8"}
+    )
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size, chunk_overlap=200
     )
@@ -91,12 +105,19 @@ def format_docs(docs):
 def handle_question(chain, question: str, chat_history):
     if not question:
         return "", chat_history
+    if chat_history is None:
+        chat_history = []
     try:
         result = chain.invoke(question)
-        chat_history.append((question, result))
+        # 使用字典格式兼容新版本 Gradio
+        chat_history.append({"role": "user", "content": question})
+        chat_history.append({"role": "assistant", "content": result})
         return "", chat_history
     except Exception as e:
-        return str(e), chat_history
+        error_msg = str(e)
+        chat_history.append({"role": "user", "content": question})
+        chat_history.append({"role": "assistant", "content": f"错误: {error_msg}"})
+        return "", chat_history
 
 
 # 确保数据存在
@@ -123,7 +144,7 @@ with gr.Blocks() as demo:
     gr.Markdown(TITLE)
 
     init_status = gr.Textbox(label="初始化状态", value="数据库已初始化", interactive=False)
-    chatbot = gr.Chatbot(height=450, show_copy_button=True)
+    chatbot = gr.Chatbot(height=450, value=[])
     msg = gr.Textbox(label="输入你的疑问")
 
     examples = gr.Examples(
@@ -155,4 +176,22 @@ with gr.Blocks() as demo:
 
 # 启动Gradio应用
 if __name__ == "__main__":
-    demo.launch()
+    # 默认监听所有网络接口，允许局域网内其他设备访问
+    if args.local_only:
+        server_name = '127.0.0.1'  # 仅本地访问
+    else:
+        server_name = '0.0.0.0'  # 允许外部访问（默认）
+    
+    server_port = args.port
+    
+    print(f"🚀 启动服务器: http://{server_name}:{server_port}")
+    if server_name == '0.0.0.0':
+        print("📱 局域网内其他设备可通过以下地址访问:")
+        print(f"   http://<你的IP地址>:{server_port}")
+        print("   提示: 在命令行运行 'ipconfig' (Windows) 或 'ifconfig' (Linux/Mac) 查看你的IP地址")
+    
+    demo.launch(
+        server_name=server_name,
+        server_port=server_port,
+        root_path=args.root_path
+    )
