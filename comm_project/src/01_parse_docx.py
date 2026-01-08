@@ -49,7 +49,14 @@ RAW_DIR = PROJECT_ROOT / "data" / "raw"
 OUT_DIR = PROJECT_ROOT / "data" / "corpus"
 OUT_PATH = OUT_DIR / "parsed_paragraphs.jsonl"
 
-SECTION_RE = re.compile(r"^(?P<section>\d+(?:\.\d+)+)\b\s*(?P<title>.*)$")
+# Regex to capture section headings like: "5.4.3.2", "Annex L", "K.2.2.5"
+SECTION_RE = re.compile(
+    r"^(?P<section>"
+    r"(?:Annex\s+[A-Z])"
+    r"|(?:[A-Z](?:\.\d+)+)"
+    r"|(?:\d+(?:\.\d+)*)"
+    r")\b\s*(?P<title>.*)$"
+)
 PAGE_RE = re.compile(r"^Page\s+\d+(?:\s+of\s+\d+)?\s*$", re.IGNORECASE)
 
 
@@ -75,6 +82,22 @@ def is_table_noise_line(s: str) -> bool:
         return True
     # Excessive runs of spaces (alignment)
     if re.search(r"\s{6,}", s):
+        return True
+    return False
+
+
+def is_toc_like_line(s: str) -> bool:
+    """Detect TOC-like lines that end with a page number.
+
+    Examples:
+      "Annex L (normative): ... 717"
+      "K.2.2.5 ... 715"
+    """
+    s = s.strip()
+    if not s:
+        return False
+    # Ends with a space + 1-4 digits
+    if re.search(r"\s\d{1,4}$", s):
         return True
     return False
 
@@ -173,6 +196,9 @@ def main() -> int:
             if is_page_number_line(ln):
                 continue
             if is_table_noise_line(ln):
+                continue
+            # Drop TOC-like lines (title + trailing page number)
+            if is_toc_like_line(ln):
                 continue
             cleaned.append(ln)
 

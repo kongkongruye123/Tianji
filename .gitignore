@@ -26,6 +26,10 @@ test/agents/metagpt/metagpt/*
 comm_project/data/raw/*.zip
 comm_project/data/raw/*/*.docx
 
+# 处理后数据：
+*.jsonl
+
+
 # 训练产物通常较大（LoRA/QLoRA adapter、日志等），默认不提交
 outputs/sft_adapter/
 outputs/dpo_adapter/

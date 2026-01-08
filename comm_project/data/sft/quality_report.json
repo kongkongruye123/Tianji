@@ -1,0 +1,9 @@
+{
+  "total": 6500,
+  "json_parse_rate": 1.0,
+  "schema_pass_rate": 1.0,
+  "quote_exact_match_rate": 1.0,
+  "refusal_ratio": 0.2,
+  "train_size": 6000,
+  "eval_size": 500
+}
