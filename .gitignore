@@ -34,6 +34,7 @@ comm_project/data/raw/*/*.docx
 outputs/sft_adapter/
 outputs/dpo_adapter/
 outputs/logs/
+comm_project/outputs/sft_adapter/
 reports/eval_base.json
 reports/eval_sft.json
 reports/eval_dpo.json

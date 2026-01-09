@@ -9,34 +9,16 @@ Input:
 Outputs:
 - comm_project/data/sft/train.jsonl
 - comm_project/data/sft/eval.jsonl
-- comm_project/data/sft/quality_report.json  (quality metrics)
+- comm_project/data/sft/quality_report.json
 
-Training sample format (aligned to docs/comm_llm_plan.md):
-{
-  "conversation": [
-    {
-      "system": "{SYSTEM_PROMPT}",
-      "input": "问题: ...\n证据:\n[chunk_id=... doc_id=... section=...]\n...",
-      "output": "{JSON}" 
-    }
-  ]
-}
+Key enhancements in this version (Plan-aligned):
+- Quotes are ALWAYS extracted as exact substrings from evidence text (quote_exact_match_rate ~= 1.0).
+- Adds "schema_anchor" samples (format drilling) to reduce schema drift during inference:
+  - Forces answer to be a STRING (not an object)
+  - Forces citations non-empty when answerable
+  - Forces refusal outputs for unanswerable with cannot_answer_reason non-empty and citations empty
 
-We generate 4 categories per plan:
-- definition-like
-- condition/shall-like
-- procedure/steps-like
-- refusal (mismatched evidence)
-
-Quality checks:
-- json_parse_rate
-- schema_pass_rate
-- quote_exact_match_rate (quote must be substring of evidence text)
-- refusal_ratio
-
-Key fix in this version:
-- Quotes are ALWAYS extracted as exact substrings from the evidence chunk text.
-  (No sentence re-joining with different whitespace/newlines.)
+The produced JSON schema must match docs/comm_llm_plan.md 0.4.
 """
 
 import argparse
@@ -46,9 +28,7 @@ import re
 import sys
 from pathlib import Path
 
-# Make imports work whether running as a module or as a script from repo root
 THIS_DIR = Path(__file__).resolve().parent
-# add comm_project/src to sys.path so we can import utils.prompts
 sys.path.insert(0, str(THIS_DIR))
 
 from utils.prompts import SYSTEM_PROMPT, format_user_prompt, validate_json_output
@@ -79,36 +59,28 @@ def write_jsonl(path: Path, rows):
 
 
 def pick_quote_exact(text: str, rng: random.Random, min_len: int, max_len: int):
-    """Pick an exact substring from text.
-
-    This guarantees: quote in text.
-    We avoid reformatting whitespace/newlines.
-    """
-    text = text or ""
-    text = text.strip()
+    """Pick an exact substring from text. Guarantees quote in text."""
+    text = (text or "").strip()
     if len(text) < min_len:
         return None
 
-    # Prefer selecting within a single line or a few consecutive lines
-    lines = text.split("\n")
-    lines = [ln for ln in lines if ln.strip()]
+    # Prefer contiguous 1-3 lines
+    lines = [ln for ln in text.split("\n") if ln.strip()]
     if lines:
-        # pick a start line and take 1-3 lines
-        for _ in range(10):
+        for _ in range(12):
             i = rng.randrange(0, len(lines))
             take = rng.choice([1, 2, 3])
             block = "\n".join(lines[i : i + take]).strip()
             if min_len <= len(block) <= max_len and block in text:
                 return block
 
-    # fallback: random window
-    for _ in range(20):
+    # Fallback window
+    for _ in range(30):
         L = rng.randrange(min_len, min(max_len, len(text)) + 1)
         start = rng.randrange(0, len(text) - L + 1)
-        quote = text[start : start + L]
-        quote = quote.strip()
-        if min_len <= len(quote) <= max_len and quote in text:
-            return quote
+        q = text[start : start + L].strip()
+        if min_len <= len(q) <= max_len and q in text:
+            return q
 
     return None
 
@@ -139,12 +111,12 @@ def make_output_refusal(reason: str, confidence: str = "low") -> dict:
 
 
 def build_evidence_text(chunks):
-    lines = []
+    blocks = []
     for ch in chunks:
-        lines.append(
+        blocks.append(
             f"[chunk_id={ch['chunk_id']} doc_id={ch['doc_id']} section={ch['section']}]\n{ch['text']}"
         )
-    return "\n\n".join(lines)
+    return "\n\n".join(blocks)
 
 
 def make_samples_from_chunk(chunk: dict, rng: random.Random):
@@ -157,8 +129,7 @@ def make_samples_from_chunk(chunk: dict, rng: random.Random):
         quote = pick_quote_exact(text, rng, min_len=60, max_len=240)
         if quote:
             q = f"What does the evidence define or state about: {chunk.get('title') or 'this concept'}?"
-            ans = quote
-            out = make_output_answerable(chunk, quote, ans, confidence="high")
+            out = make_output_answerable(chunk, quote, quote, confidence="high")
             samples.append((q, [chunk], out, "definition"))
 
     # Condition/shall-like
@@ -166,19 +137,47 @@ def make_samples_from_chunk(chunk: dict, rng: random.Random):
         quote = pick_quote_exact(text, rng, min_len=60, max_len=240)
         if quote:
             q = "Under what condition does the specification require the described behavior?"
-            ans = quote
-            out = make_output_answerable(chunk, quote, ans, confidence="mid")
+            out = make_output_answerable(chunk, quote, quote, confidence="mid")
             samples.append((q, [chunk], out, "condition"))
 
-    # Procedure/steps-like: take a longer quote window, answer as bullet points of the lines
+    # Procedure/steps-like
     quote = pick_quote_exact(text, rng, min_len=180, max_len=650)
     if quote:
         q = "Describe the steps or process mentioned in the evidence."
-        # Bulletize by lines (keeps groundedness; avoids inventing extra steps)
         steps = [ln.strip() for ln in quote.split("\n") if ln.strip()]
         ans = "\n".join([f"- {s}" for s in steps[:10]])
         out = make_output_answerable(chunk, quote, ans, confidence="mid")
         samples.append((q, [chunk], out, "procedure"))
+
+    return samples
+
+
+def make_schema_anchor_samples(chunk: dict, rng: random.Random):
+    """Format drilling samples to anchor schema strictly."""
+    samples = []
+    text = chunk["text"]
+
+    # Answerable anchor
+    quote = pick_quote_exact(text, rng, min_len=80, max_len=220)
+    if quote:
+        q = (
+            "You MUST output a JSON object that strictly matches the required schema. "
+            "Answer using ONLY the evidence and include at least one citation with an exact quote substring."
+        )
+        # Keep answer as STRING explicitly
+        ans = f"{quote}"
+        out = make_output_answerable(chunk, quote, ans, confidence="high")
+        samples.append((q, [chunk], out, "schema_anchor_answerable"))
+
+    # Unanswerable anchor (mismatch evidence)
+    # We still need a question but provide unrelated evidence in caller.
+    q2 = (
+        "You MUST output a JSON object that strictly matches the required schema. "
+        "If evidence is insufficient, refuse with cannot_answer_reason and empty citations."
+    )
+    out2 = make_output_refusal("The provided evidence is insufficient to answer the question.", confidence="low")
+    # Note: caller will supply mismatched evidence
+    samples.append((q2, [chunk], out2, "schema_anchor_refusal"))
 
     return samples
 
@@ -189,6 +188,7 @@ def main():
     ap.add_argument("--train", type=int, default=6000)
     ap.add_argument("--eval", type=int, default=500)
     ap.add_argument("--refusal_ratio", type=float, default=0.2)
+    ap.add_argument("--schema_anchor_ratio", type=float, default=0.25)
     args = ap.parse_args()
 
     rng = random.Random(args.seed)
@@ -205,53 +205,76 @@ def main():
     total = args.train + args.eval
     target_refusals = int(round(total * args.refusal_ratio))
     target_answerables = total - target_refusals
+    target_schema_anchor = int(round(target_answerables * args.schema_anchor_ratio))
 
     sft_rows = []
 
-    # Generate answerable samples
+    def add_row(question: str, evidence_chunks, out_obj: dict):
+        evidence_text = build_evidence_text(evidence_chunks)
+        user_prompt = format_user_prompt(question, evidence_text=evidence_text)
+        out_str = json.dumps(out_obj, ensure_ascii=False)
+        sft_rows.append(
+            {
+                "conversation": [
+                    {
+                        "system": SYSTEM_PROMPT.strip(),
+                        "input": user_prompt.strip(),
+                        "output": out_str,
+                    }
+                ]
+            }
+        )
+
+    # 1) Schema anchor answerables
+    anchor_added = 0
     for ch in corpus:
-        for (q, ev_chunks, out_obj, _kind) in make_samples_from_chunk(ch, rng):
-            # Safety: quote must be exact substring
-            quote = out_obj["citations"][0]["quote"]
-            if quote not in ch["text"]:
+        for (q, ev, out_obj, kind) in make_schema_anchor_samples(ch, rng):
+            if kind != "schema_anchor_answerable":
                 continue
-
-            evidence_text = build_evidence_text(ev_chunks)
-            user_prompt = format_user_prompt(q, evidence_text=evidence_text)
-            out_str = json.dumps(out_obj, ensure_ascii=False)
-
-            sft_rows.append(
-                {
-                    "conversation": [
-                        {
-                            "system": SYSTEM_PROMPT.strip(),
-                            "input": user_prompt.strip(),
-                            "output": out_str,
-                        }
-                    ]
-                }
-            )
-
-            if len(sft_rows) >= target_answerables:
+            # ensure quote is exact substring
+            qt = out_obj["citations"][0]["quote"]
+            if qt not in ch["text"]:
+                continue
+            add_row(q, ev, out_obj)
+            anchor_added += 1
+            if anchor_added >= target_schema_anchor:
                 break
-        if len(sft_rows) >= target_answerables:
+        if anchor_added >= target_schema_anchor:
             break
 
-    # Generate refusal samples by mismatching evidence
+    # 2) Regular answerables
+    for ch in corpus:
+        if len(sft_rows) >= target_answerables:
+            break
+        for (q, ev_chunks, out_obj, _kind) in make_samples_from_chunk(ch, rng):
+            qt = out_obj["citations"][0]["quote"]
+            if qt not in ch["text"]:
+                continue
+            add_row(q, ev_chunks, out_obj)
+            if len(sft_rows) >= target_answerables:
+                break
+
+    # 3) Refusals (mismatched evidence)
     refusal_rows = []
-    for _ in range(target_refusals * 3):  # oversample then cut
+    for _ in range(target_refusals * 4):
         src = rng.choice(corpus)
+        # derive a question from src quote
         quote = pick_quote_exact(src["text"], rng, min_len=40, max_len=180)
         if not quote:
             continue
         q = f"According to the evidence, what does the specification state about: {quote[:120]}...?"
+
+        # mismatched evidence chunk
         evidence = rng.choice(corpus)
         if evidence["chunk_id"] == src["chunk_id"]:
             continue
 
+        out_obj = make_output_refusal(
+            "The provided evidence does not contain the information needed to answer the question.",
+            confidence="low",
+        )
         evidence_text = build_evidence_text([evidence])
         user_prompt = format_user_prompt(q, evidence_text=evidence_text)
-        out_obj = make_output_refusal("The provided evidence does not contain the information needed to answer the question.")
         out_str = json.dumps(out_obj, ensure_ascii=False)
 
         refusal_rows.append(
@@ -268,10 +291,33 @@ def main():
         if len(refusal_rows) >= target_refusals:
             break
 
-    sft_rows.extend(refusal_rows)
-    rng.shuffle(sft_rows)
+    # 4) Schema anchor refusals (extra drilling)
+    # Use schema_anchor_refusal template but provide mismatched evidence.
+    anchor_refusal_rows = []
+    for _ in range(max(50, target_refusals // 5)):
+        ev = rng.choice(corpus)
+        (q2, _ev_chunks, out2, kind) = make_schema_anchor_samples(ev, rng)[-1]
+        if kind != "schema_anchor_refusal":
+            continue
+        evidence_text = build_evidence_text([ev])
+        user_prompt = format_user_prompt(q2, evidence_text=evidence_text)
+        out_str = json.dumps(out2, ensure_ascii=False)
+        anchor_refusal_rows.append(
+            {
+                "conversation": [
+                    {
+                        "system": SYSTEM_PROMPT.strip(),
+                        "input": user_prompt.strip(),
+                        "output": out_str,
+                    }
+                ]
+            }
+        )
 
-    # Split train/eval
+    sft_rows.extend(refusal_rows)
+    sft_rows.extend(anchor_refusal_rows)
+
+    rng.shuffle(sft_rows)
     train_rows = sft_rows[: args.train]
     eval_rows = sft_rows[args.train : args.train + args.eval]
 
@@ -279,8 +325,8 @@ def main():
     write_jsonl(TRAIN_PATH, train_rows)
     write_jsonl(EVAL_PATH, eval_rows)
 
-    # Quality report
-    total_outputs = len(sft_rows)
+    # Quality report on generated outputs
+    total_outputs = len(train_rows) + len(eval_rows)
     json_ok = 0
     schema_ok = 0
     quote_ok = 0
@@ -288,7 +334,7 @@ def main():
 
     evidence_map = {c["chunk_id"]: c for c in corpus}
 
-    for row in sft_rows:
+    for row in (train_rows + eval_rows):
         out_str = row["conversation"][0]["output"]
         try:
             obj = json.loads(out_str)
@@ -306,10 +352,10 @@ def main():
         cits = obj.get("citations") or []
         if obj.get("cannot_answer_reason") is None and cits:
             cit = cits[0]
-            chunk_id = cit.get("chunk_id")
-            quote = cit.get("quote")
-            ev = evidence_map.get(chunk_id)
-            if ev and isinstance(quote, str) and quote in ev.get("text", ""):
+            cid = cit.get("chunk_id")
+            qt = cit.get("quote")
+            ev = evidence_map.get(cid)
+            if ev and isinstance(qt, str) and qt in ev.get("text", ""):
                 quote_ok += 1
 
     report = {
@@ -320,6 +366,7 @@ def main():
         "refusal_ratio": refusal / total_outputs if total_outputs else 0,
         "train_size": len(train_rows),
         "eval_size": len(eval_rows),
+        "schema_anchor_ratio": args.schema_anchor_ratio,
     }
 
     REPORT_PATH.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

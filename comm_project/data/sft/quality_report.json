@@ -3,7 +3,8 @@
   "json_parse_rate": 1.0,
   "schema_pass_rate": 1.0,
   "quote_exact_match_rate": 1.0,
-  "refusal_ratio": 0.2,
+  "refusal_ratio": 0.22938461538461538,
   "train_size": 6000,
-  "eval_size": 500
+  "eval_size": 500,
+  "schema_anchor_ratio": 0.25
 }
