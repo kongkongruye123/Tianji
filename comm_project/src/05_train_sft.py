@@ -47,10 +47,12 @@ def parse_args():
     ap.add_argument("--run_name", default=None)
 
     ap.add_argument("--max_length", type=int, default=2048)
-    ap.add_argument("--max_output_tokens", type=int, default=700, help="Cap output(JSON) length to fit max_length")
+    # NOTE: default reduced from 700 to 512 to reduce VRAM spikes (OOM safety).
+    ap.add_argument("--max_output_tokens", type=int, default=512, help="Cap output(JSON) length to fit max_length")
 
     ap.add_argument("--num_train_epochs", type=float, default=1.0)
     ap.add_argument("--per_device_train_batch_size", type=int, default=1)
+    ap.add_argument("--group_by_length", action="store_true", default=True, help="Reduce padding/peak VRAM by grouping similar lengths")
     ap.add_argument("--per_device_eval_batch_size", type=int, default=1)
     ap.add_argument("--gradient_accumulation_steps", type=int, default=16)
     ap.add_argument("--learning_rate", type=float, default=1e-4)
@@ -63,7 +65,7 @@ def parse_args():
 
     ap.add_argument("--seed", type=int, default=42)
 
-    ap.add_argument("--lora_r", type=int, default=8)
+    ap.add_argument("--lora_r", type=int, default=4)
     ap.add_argument("--lora_alpha", type=int, default=32)
     ap.add_argument("--lora_dropout", type=float, default=0.05)
 
@@ -71,6 +73,11 @@ def parse_args():
     ap.add_argument("--no_4bit", action="store_true")
 
     ap.add_argument("--gradient_checkpointing", action="store_true", default=True)
+
+    # OOM safety knobs
+    ap.add_argument("--eval_accumulation_steps", type=int, default=8, help="Accumulate eval batches on CPU to reduce VRAM spikes")
+    ap.add_argument("--save_total_limit", type=int, default=1)
+    ap.add_argument("--optim", type=str, default="paged_adamw_8bit", help="Optimizer; use paged_adamw_8bit for QLoRA")
 
     return ap.parse_args()
 
@@ -257,7 +264,7 @@ def main():
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         eval_steps=args.eval_steps,
-        save_total_limit=2,
+        save_total_limit=args.save_total_limit,
         load_best_model_at_end=False,
         bf16=(dtype == torch.bfloat16),
         fp16=(dtype == torch.float16),
@@ -266,6 +273,9 @@ def main():
         report_to=["tensorboard"],
         logging_dir=str(tb_logdir),
         run_name=run_name,
+        eval_accumulation_steps=args.eval_accumulation_steps,
+        optim=args.optim,
+        group_by_length=args.group_by_length,
     )
 
     from transformers import TrainingArguments as _TA
