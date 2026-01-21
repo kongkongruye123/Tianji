@@ -26,6 +26,7 @@ import torch
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 from utils.prompts import SYSTEM_PROMPT, format_user_prompt, validate_json_output  # noqa: E402
+from utils.retrieval import format_chunks_as_evidence_text, retrieve_topk  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]  # comm_project/
 DEFAULT_BASE_MODEL = "qwen/Qwen2.5-1.5B-Instruct"
@@ -277,6 +278,36 @@ def process_query(model_type: str, question: str, evidence: str, use_4bit: bool)
     return raw_output_display, parsed_output_display, highlighted_evidence, "✅ 处理完成，已记录日志"
 
 
+def auto_retrieve_and_answer(model_type: str, question: str, top_k: int, use_4bit: bool):
+    """User only inputs question; system retrieves evidence automatically and answers."""
+    if not question or not question.strip():
+        return "", "请输入问题。", "", "", "", "❌ 问题为空"
+
+    # Retrieve
+    try:
+        chunks, info = retrieve_topk(question.strip(), top_k=int(top_k))
+        evidence_text = format_chunks_as_evidence_text(chunks)
+    except Exception as e:
+        # Friendly guidance (especially when corpus is missing)
+        msg = str(e)
+        if "缺少证据库文件" in msg:
+            hint = (
+                msg
+                + "\n\n建议按顺序执行：\n"
+                + "  python comm_project/src/01_parse_docx.py\n"
+                + "  python comm_project/src/02_build_corpus.py\n"
+                + "  python comm_project/src/11_build_index.py\n"
+            )
+            return "", hint, "", "", "", "❌ 缺少证据库"
+        return "", f"检索失败: {msg}", "", "", "", "❌ 检索失败"
+
+    # Answer using retrieved evidence
+    raw_json, parsed_md, highlighted_evidence, status = process_query(
+        model_type=model_type, question=question, evidence=evidence_text, use_4bit=use_4bit
+    )
+    return evidence_text, info, raw_json, parsed_md, highlighted_evidence, status
+
+
 def create_demo():
     """Create Gradio interface."""
     with gr.Blocks(title="通信标准问答助手", theme=gr.themes.Soft()) as demo:
@@ -313,6 +344,18 @@ def create_demo():
                     lines=3,
                 )
                 
+                gr.Markdown("### 自动检索（用户只输入问题也可用）")
+                top_k = gr.Slider(
+                    minimum=1,
+                    maximum=10,
+                    value=5,
+                    step=1,
+                    label="自动检索Top-K",
+                    info="从本地证据库中检索最相关的 K 个 chunk 作为证据",
+                )
+                auto_btn = gr.Button("自动检索并回答", variant="secondary")
+                retrieve_info = gr.Textbox(label="检索信息", interactive=False, lines=6)
+
                 evidence = gr.Textbox(
                     label="证据",
                     placeholder="""支持多chunk格式，例如：
@@ -348,6 +391,12 @@ The PDU Session establishment procedure is initiated by the UE.
             inputs=[model_type, question, evidence, use_4bit],
             outputs=[raw_json, parsed_output, highlighted_evidence, status],
         )
+
+        auto_btn.click(
+            fn=auto_retrieve_and_answer,
+            inputs=[model_type, question, top_k, use_4bit],
+            outputs=[evidence, retrieve_info, raw_json, parsed_output, highlighted_evidence, status],
+        )
         
         gr.Markdown(
             """
@@ -355,7 +404,9 @@ The PDU Session establishment procedure is initiated by the UE.
             **注意**: 
             - 所有查询都会记录到 `data/logs/demo_calls.jsonl`
             - 引用高亮使用黄色背景标记
-            - 如果模型未训练完成，相应选项可能无法使用
+            - 自动检索依赖本地证据库：`comm_project/data/corpus/evidence_corpus.jsonl`
+              - 若缺失，请先运行：`01_parse_docx.py` ➜ `02_build_corpus.py`（可选再跑 `11_build_index.py` 预建索引）
+            - 如果模型未训练完成，相应选项可能无法使用（例如 dpo adapter 未生成）
             """
         )
     
